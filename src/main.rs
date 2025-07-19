@@ -287,7 +287,7 @@ async fn save_metadata(
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
             let file_name = file.name();
-            if file_name == "docProps/core.xml" || file_name == "docProps/app.xml" {
+            if file_name == "docProps/core.xml" {
                 continue; // Skip old property files
             }
             zip_writer
@@ -299,21 +299,13 @@ async fn save_metadata(
         }
 
         // Create and write the modified core.xml
-        let new_core_xml = generate_core_xml(&path, &created_date, &modified_date)?;
+        let new_core_xml =
+            generate_core_xml(&path, &created_date, &modified_date, &last_printed_date)?;
         zip_writer
             .start_file("docProps/core.xml", options)
             .map_err(|e| e.to_string())?;
         zip_writer
             .write_all(new_core_xml.as_bytes())
-            .map_err(|e| e.to_string())?;
-
-        // Create and write the modified app.xml
-        let new_app_xml = generate_app_xml(&path, &last_printed_date)?;
-        zip_writer
-            .start_file("docProps/app.xml", options)
-            .map_err(|e| e.to_string())?;
-        zip_writer
-            .write_all(new_app_xml.as_bytes())
             .map_err(|e| e.to_string())?;
 
         zip_writer.finish().map_err(|e| e.to_string())?;
@@ -326,6 +318,7 @@ fn generate_core_xml(
     original_path: &Path,
     new_created: &str,
     new_modified: &str,
+    last_printed: &str,
 ) -> Result<String, String> {
     let file = File::open(original_path).map_err(|e| e.to_string())?;
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
@@ -340,18 +333,22 @@ fn generate_core_xml(
     let mut reader = Reader::from_reader(&core_props_buffer[..]);
     let mut writer = Writer::new(Cursor::new(Vec::new()));
     let mut buf = Vec::new();
+    let mut in_target_elem = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let elem_name = e.name();
-                let should_replace = elem_name.as_ref() == b"dcterms:created"
-                    || elem_name.as_ref() == b"dcterms:modified";
+                if elem_name.as_ref() == b"dcterms:created"
+                    || elem_name.as_ref() == b"dcterms:modified"
+                    || elem_name.as_ref() == b"cp:lastPrinted"
+                {
+                    in_target_elem = true;
+                    writer.write_event(Event::Start(e.to_owned())).unwrap();
 
-                writer.write_event(Event::Start(e.to_owned())).unwrap();
-
-                if should_replace {
-                    let text_to_write = if elem_name.as_ref() == b"dcterms:created" {
+                    let text_to_write = if elem_name.as_ref() == b"cp:lastPrinted" {
+                        last_printed
+                    } else if elem_name.as_ref() == b"dcterms:created" {
                         new_created
                     } else {
                         new_modified
@@ -359,75 +356,22 @@ fn generate_core_xml(
                     writer
                         .write_event(Event::Text(BytesText::new(text_to_write)))
                         .unwrap();
-                    // Skip the original text event by reading until the end of the element
-                    reader.read_to_end_into(elem_name, &mut Vec::new()).unwrap();
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(e) => {
-                writer.write_event(e).unwrap();
-            }
-            Err(e) => return Err(format!("XML (core) 处理错误: {}", e)),
-        }
-        buf.clear();
-    }
-
-    String::from_utf8(writer.into_inner().into_inner()).map_err(|e| e.to_string())
-}
-
-fn generate_app_xml(original_path: &Path, new_last_printed: &str) -> Result<String, String> {
-    let file = File::open(original_path).map_err(|e| e.to_string())?;
-    let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
-
-    // app.xml is optional, so we handle its absence gracefully.
-    let app_props_buffer = match archive.by_name("docProps/app.xml") {
-        Ok(mut entry) => {
-            let mut buffer = Vec::new();
-            entry.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
-            buffer
-        }
-        Err(_) => {
-            // If app.xml doesn't exist, create a default structure.
-            return Ok(format!(
-                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
-  <Application>Microsoft Office Word</Application>
-  <LastPrinted>{}</LastPrinted>
-</Properties>"#,
-                new_last_printed
-            ));
-        }
-    };
-
-    let mut reader = Reader::from_reader(&app_props_buffer[..]);
-    let mut writer = Writer::new(Cursor::new(Vec::new()));
-    let mut buf = Vec::new();
-    let mut found_last_printed = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                if e.name().as_ref() == b"LastPrinted" {
-                    found_last_printed = true;
-                    writer.write_event(Event::Start(e.to_owned())).unwrap();
-                    writer
-                        .write_event(Event::Text(BytesText::new(new_last_printed)))
-                        .unwrap();
-                    reader.read_to_end_into(e.name(), &mut Vec::new()).unwrap();
                 } else {
                     writer.write_event(Event::Start(e.to_owned())).unwrap();
                 }
             }
+            Ok(Event::Text(_)) if in_target_elem => {
+                // Skip the original text content of the target element
+            }
             Ok(Event::End(e)) => {
-                // If we are at the end of the root and haven't found the tag, add it.
-                if e.name().as_ref() == b"Properties"
-                    && !found_last_printed
-                    && !new_last_printed.is_empty()
-                {
-                    writer
-                        .create_element("LastPrinted")
-                        .write_text_content(BytesText::new(new_last_printed))
-                        .unwrap();
+                if in_target_elem {
+                    let elem_name = e.name();
+                    if elem_name.as_ref() == b"dcterms:created"
+                        || elem_name.as_ref() == b"dcterms:modified"
+                        || elem_name.as_ref() == b"cp:lastPrinted"
+                    {
+                        in_target_elem = false;
+                    }
                 }
                 writer.write_event(Event::End(e.to_owned())).unwrap();
             }
@@ -435,7 +379,7 @@ fn generate_app_xml(original_path: &Path, new_last_printed: &str) -> Result<Stri
             Ok(e) => {
                 writer.write_event(e).unwrap();
             }
-            Err(e) => return Err(format!("XML (app) 处理错误: {}", e)),
+            Err(e) => return Err(format!("XML (core) 处理错误: {}", e)),
         }
         buf.clear();
     }
